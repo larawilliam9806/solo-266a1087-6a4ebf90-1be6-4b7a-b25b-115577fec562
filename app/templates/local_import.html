@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}本地时刻导入 - 电量日核算{% endblock %}
+{% block content %}
+<section class="card">
+  <h2>本地时刻 CSV 导入（IANA 时区消歧）</h2>
+  <p class="hint">
+    适用于只记录电表<b>当地墙钟时刻</b>的导出文件。系统按所选 IANA 时区把当地时刻解释为 UTC，
+    夏令时回拨导致同一当地时刻对应两个 UTC 时刻时，会在全部业务约束下消歧；
+    解释不唯一、无解或当地时刻不存在时整批拒绝。
+  </p>
+  <form method="post" action="{{ url_for('main.upload_local') }}" enctype="multipart/form-data" class="local-form">
+    <label>计量点
+      <input list="point-list" name="point" required maxlength="200" placeholder="选择已有计量点或输入新点">
+      <datalist id="point-list">
+        {% for p in points %}<option value="{{ p }}">{% endfor %}
+      </datalist>
+    </label>
+    <label>IANA 时区
+      <select name="timezone" required>
+        <option value="" disabled selected>请选择时区</option>
+        <optgroup label="常用时区">
+          {% for tz in common_tz %}<option value="{{ tz }}">{{ tz }}</option>{% endfor %}
+        </optgroup>
+        <optgroup label="全部时区">
+          {% for tz in all_tz %}<option value="{{ tz }}">{{ tz }}</option>{% endfor %}
+        </optgroup>
+      </select>
+    </label>
+    <label>CSV 文件（同一当地日内最多 {{ max_rows }} 行）
+      <input type="file" name="file" accept=".csv" required>
+    </label>
+    <button type="submit">校验并导入</button>
+  </form>
+  <p class="hint">
+    表头 <code>local_ts,type,value</code>：当地时刻（不带时区，如 <code>2026-11-01 01:30:00</code>）、
+    记录类型（<code>reading</code> 读数 / <code>swap</code> 换表）、累计千瓦时；
+    换表行的 <code>value</code> 留空。行须按设备记录顺序（当地时刻不递减）排列。
+  </p>
+  <pre class="sample">local_ts,type,value
+2026-11-01 00:00:00,reading,1000
+2026-11-01 01:30:00,swap,
+2026-11-01 01:30:00,reading,12
+2026-11-01 03:00:00,reading,18.5</pre>
+</section>
+
+<section class="card">
+  <h2>校验口径</h2>
+  <ul class="hint rules">
+    <li>解释出的 UTC 时刻按 CSV 行序不递减；同一 UTC 时刻最多一条读数、一条换表。</li>
+    <li>与库中明细合并后不得出现同刻异值，也不得出现区间内无换表的读数倒退；含换表的区间按缺口处理。</li>
+    <li>仅当可行 UTC 解释<b>恰好一种</b>时才入库；无解、多解、不存在的当地时刻都会指出相关 CSV 行并整批拒绝。</li>
+    <li>读数与换表在同一事务内同时生效；被拒绝或入库失败的文件不会改动既有读数、换表或数据版本。</li>
+  </ul>
+  <p><a href="{{ url_for('main.index') }}">返回 UTC 上传与查询首页</a></p>
+</section>
+{% endblock %}

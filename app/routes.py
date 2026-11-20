@@ -12,12 +12,12 @@ from flask import (
     url_for,
 )
 
-from . import logic
+from . import logic, local_import
 from .db import get_db
 
 bp = Blueprint("main", __name__)
 
-KIND_NAMES = {"readings": "读数", "swaps": "换表"}
+KIND_NAMES = {"readings": "读数", "swaps": "换表", "local": "本地时刻混合导入"}
 
 
 def data_version(conn):
@@ -127,6 +127,103 @@ def upload(kind):
         conn.execute("ROLLBACK")
         flash(f"系统繁忙，请重试（{e}）", "error")
     return redirect(url_for("main.index"))
+
+
+@bp.route("/import/local")
+def local_import_page():
+    """本地时刻 CSV 导入页：选择计量点与 IANA 时区后上传。"""
+    conn = get_db()
+    conn.execute("BEGIN")  # 单个读事务：页面看到的是同一版快照
+    try:
+        points = list_points(conn)
+        version = data_version(conn)
+        common_tz, all_tz = local_import.list_timezones()
+    finally:
+        conn.execute("COMMIT")
+    return render_template(
+        "local_import.html",
+        points=points,
+        version=version,
+        common_tz=common_tz,
+        all_tz=all_tz,
+        max_rows=local_import.MAX_LOCAL_ROWS,
+    )
+
+
+@bp.route("/upload/local", methods=["POST"])
+def upload_local():
+    """本地时刻混合 CSV：读数与换表在同一文件、同一事务内消歧并生效。"""
+    point = (request.form.get("point") or "").strip()
+    tz_name = (request.form.get("timezone") or "").strip()
+    f = request.files.get("file")
+
+    if not point:
+        flash("上传被拒绝：请选择或填写计量点", "error")
+        return redirect(url_for("main.local_import_page"))
+    if len(point) > logic.MAX_POINT_LEN:
+        flash(
+            f"上传被拒绝：计量点名称过长（>{logic.MAX_POINT_LEN} 字符）", "error"
+        )
+        return redirect(url_for("main.local_import_page"))
+    if f is None or not f.filename:
+        flash("上传被拒绝：请选择要上传的 CSV 文件", "error")
+        return redirect(url_for("main.local_import_page"))
+    try:
+        tz = local_import.get_zone(tz_name)
+    except logic.CsvError as e:
+        flash(f"上传被拒绝：{e}", "error")
+        return redirect(url_for("main.local_import_page"))
+    try:
+        text = f.read().decode("utf-8-sig")
+    except UnicodeDecodeError:
+        flash("上传被拒绝：文件编码须为 UTF-8", "error")
+        return redirect(url_for("main.local_import_page"))
+
+    conn = get_db()
+    # 1) 解析、同当地日/顺序/行数等静态校验，以及 UTC 候选生成（不进写事务）
+    try:
+        rows, raw_count = local_import.parse_local_csv(text)
+        local_import.attach_candidates(rows, tz)
+    except logic.CsvError as e:
+        record_rejected(conn, "local", f.filename, str(e), 0)
+        flash(f"上传被拒绝：{e}", "error")
+        return redirect(url_for("main.local_import_page"))
+
+    # 2) 单个写事务：核对（消歧）与入库以同一份已提交明细为准，
+    #    读数与换表同生共死；任何失败整体回滚，旧数据与数据版本保持不变
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        cur = conn.execute(
+            "INSERT INTO uploads(kind, filename, status, message, rows_received,"
+            " rows_applied, created_at) VALUES (?,?,?,?,?,0,?)",
+            ("local", f.filename, "applied", "", raw_count, logic.now_ts()),
+        )
+        upload_id = cur.lastrowid
+        # BatchRejected 由外层统一回滚并写审计
+        chosen_ts = local_import.resolve_unique(conn, point, rows)
+        applied, skipped = local_import.apply_local_batch(
+            conn, upload_id, point, rows, chosen_ts
+        )
+        n_read = sum(1 for r in rows if r["kind"] == "R")
+        n_swap = raw_count - n_read
+        msg = (
+            f"接收 {raw_count} 行（读数 {n_read}、换表 {n_swap}），"
+            f"新增 {applied} 条，重复跳过 {skipped} 条；时区 {tz.key}"
+        )
+        conn.execute(
+            "UPDATE uploads SET rows_applied = ?, message = ? WHERE id = ?",
+            (applied, msg, upload_id),
+        )
+        conn.execute("COMMIT")
+        flash(f"本地时刻导入成功：{msg}", "success")
+    except logic.BatchRejected as e:
+        conn.execute("ROLLBACK")
+        record_rejected(conn, "local", f.filename, str(e), raw_count)
+        flash(f"上传被拒绝：{e}", "error")
+    except sqlite3.OperationalError as e:
+        conn.execute("ROLLBACK")
+        flash(f"系统繁忙，请重试（{e}）", "error")
+    return redirect(url_for("main.local_import_page"))
 
 
 def _resolve_range(conn, point, start, end):
